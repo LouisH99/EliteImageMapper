@@ -11,6 +11,7 @@ It can also optionally convert the images to another format such as PNG, JPEG, o
   - time
   - star system
   - planet / body when available
+- Remove duplicated system names from body names
 - Mark HighRes screenshots with `HR`
 - Optional image conversion:
   - PNG
