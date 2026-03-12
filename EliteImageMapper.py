@@ -23,7 +23,7 @@ IMAGE_DIR_CANDIDATES = ["images", "screenshots", "screens", "bilder"]
 JOURNAL_DIR_CANDIDATES = ["journals", "journal", "logs", "jurnals", "jurnal", "journale"]
 OUTPUT_DIR_NAME = "output"
 REPORT_FILE_NAME = "mapping_report.csv"
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 GITHUB_REPO_URL = "https://github.com/LouisH99/EliteImageMapper"
 
 
@@ -86,6 +86,7 @@ TRANSLATIONS = {
         "stop": "Stopp",
         "status": "Status",
         "progress": "Fortschritt",
+        "eta_remaining": "Restzeit ca.",
         "ready": "Bereit.",
         "running": "Verarbeitung läuft...",
         "stopping": "Verarbeitung wird gestoppt...",
@@ -154,6 +155,7 @@ TRANSLATIONS = {
         "stop": "Stop",
         "status": "Status",
         "progress": "Progress",
+        "eta_remaining": "ETA approx.",
         "ready": "Ready.",
         "running": "Processing...",
         "stopping": "Stopping...",
@@ -291,6 +293,81 @@ def detect_existing_dir(base: Path, candidates: list[str]) -> Optional[Path]:
     return None
 
 
+def iter_possible_steam_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def add_root(candidate: Optional[Path]) -> None:
+        if candidate is None:
+            return
+        try:
+            resolved = str(candidate.expanduser().resolve(strict=False))
+        except Exception:
+            resolved = str(candidate)
+        key = resolved.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(Path(resolved))
+
+    if os.name == "nt":
+        try:
+            import winreg  # type: ignore
+
+            reg_locations = [
+                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
+            ]
+            for hive, subkey in reg_locations:
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        for value_name in ("SteamPath", "InstallPath", "SteamExe"):
+                            try:
+                                value, _ = winreg.QueryValueEx(key, value_name)
+                            except OSError:
+                                continue
+                            if not value:
+                                continue
+                            candidate = Path(str(value))
+                            if value_name == "SteamExe":
+                                candidate = candidate.parent
+                            add_root(candidate)
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+        add_root(Path.home() / "AppData" / "Local" / "Steam")
+        add_root(Path.home() / "AppData" / "Roaming" / "Steam")
+        add_root(Path("C:/Program Files (x86)/Steam"))
+        add_root(Path("C:/Program Files/Steam"))
+
+    return roots
+
+
+def get_default_steam_screenshot_dir() -> Optional[Path]:
+    if os.name != "nt":
+        return None
+
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for steam_root in iter_possible_steam_roots():
+        try:
+            for candidate in steam_root.glob("userdata/*/760/remote/359320/screenshots"):
+                if candidate.exists() and candidate.is_dir():
+                    key = str(candidate).lower()
+                    if key not in seen:
+                        seen.add(key)
+                        matches.append(candidate)
+        except Exception:
+            continue
+
+    if not matches:
+        return None
+    return sorted(matches, key=lambda p: str(p).lower())[0]
+
+
 def get_default_image_dir(base_dir: Path) -> Path:
     if os.name == "nt":
         pictures = Path.home() / "Pictures" / "Frontier Developments" / "Elite Dangerous"
@@ -339,7 +416,7 @@ def iter_image_files(folders: list[Path]) -> list[Path]:
     for folder in folders:
         if not folder.exists() or not folder.is_dir():
             continue
-        for p in folder.rglob("*"):
+        for p in folder.iterdir():
             if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
                 rp = p.resolve()
                 if rp not in seen:
@@ -365,6 +442,26 @@ def choose(value1: Optional[str], value2: Optional[str] = None, value3: Optional
 
 def clamp_int(value: int, low: int, high: int) -> int:
     return max(low, min(high, int(value)))
+
+
+def format_duration_compact(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return ""
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def build_progress_text(done: int, total: int, lang: str = "de", eta_seconds: Optional[float] = None) -> str:
+    text = f"{done} / {total}"
+    if total > 0 and eta_seconds is not None:
+        text += f" • {t(lang, 'eta_remaining')}: {format_duration_compact(eta_seconds)}"
+    return text
 
 
 def get_filesystem_time_candidates(path: Path) -> list[ImageTimeCandidate]:
@@ -718,6 +815,12 @@ def get_conversion_suffix(settings: ConversionSettings, source_path: Path) -> st
     return mapping.get(settings.target_format.lower(), source_path.suffix.lower())
 
 
+def should_skip_reconversion(source_path: Path, settings: ConversionSettings) -> bool:
+    if not settings.enabled:
+        return False
+    return source_path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+
+
 def save_converted_image(source_path: Path, destination: Path, settings: ConversionSettings) -> None:
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow is required for image conversion.")
@@ -756,7 +859,7 @@ def process_image_dirs(
     conversion_settings: Optional[ConversionSettings] = None,
     logger: Optional[Callable[[str], None]] = None,
     lang: str = "de",
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_callback: Optional[Callable[[int, int, Optional[float]], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> bool:
     settings = conversion_settings or ConversionSettings()
@@ -768,9 +871,9 @@ def process_image_dirs(
         else:
             print(message)
 
-    def update_progress(done: int, total: int) -> None:
+    def update_progress(done: int, total: int, eta_seconds: Optional[float] = None) -> None:
         if progress_callback:
-            progress_callback(done, total)
+            progress_callback(done, total, eta_seconds)
 
     images = iter_image_files(image_dirs)
     if not images:
@@ -795,6 +898,7 @@ def process_image_dirs(
     emit(f"{t(lang, 'output')}: {output_dir}")
 
     completed = True
+    started_at = time.monotonic()
 
     for idx, (_, image_path, candidates, oldest_fs, filename_date_only) in enumerate(preprocessed, 1):
         if stop_event and stop_event.is_set():
@@ -804,11 +908,12 @@ def process_image_dirs(
 
         match = pick_best_match(image_path, candidates, oldest_fs, screenshot_by_filename, screenshot_events, screenshot_timestamps, timeline, timeline_timestamps, journal_min_utc, journal_max_utc)
         is_highres = has_highres_marker(image_path)
-        new_suffix = get_conversion_suffix(settings, image_path)
+        skip_reconversion = should_skip_reconversion(image_path, settings)
+        new_suffix = image_path.suffix.lower() if skip_reconversion else get_conversion_suffix(settings, image_path)
         new_name = build_new_filename(match, new_suffix, is_highres)
         destination = unique_destination(output_dir / new_name)
 
-        if settings.enabled:
+        if settings.enabled and not skip_reconversion:
             save_converted_image(image_path, destination, settings)
             action = t(lang, "action_converted")
         else:
@@ -848,8 +953,16 @@ def process_image_dirs(
             "checked_time_candidates": candidate_summary,
         })
 
-        emit(f"[{idx:>4}/{total}] {image_path.name} -> {destination.name} ({match.chosen_time_source}, {match.method}, {match.confidence}, {action})")
-        update_progress(idx, total)
+        elapsed_seconds = max(0.0, time.monotonic() - started_at)
+        avg_seconds_per_image = elapsed_seconds / idx
+        remaining_eta_seconds = avg_seconds_per_image * max(total - idx, 0)
+        eta_text = f" | {t(lang, 'eta_remaining')}: {format_duration_compact(remaining_eta_seconds)}"
+
+        if skip_reconversion:
+            emit(f"[{idx:>4}/{total}] {image_path.name} -> {destination.name} ({match.chosen_time_source}, {match.method}, {match.confidence}, {action}, JPEG/PNG nicht erneut konvertiert){eta_text}")
+        else:
+            emit(f"[{idx:>4}/{total}] {image_path.name} -> {destination.name} ({match.chosen_time_source}, {match.method}, {match.confidence}, {action}){eta_text}")
+        update_progress(idx, total, remaining_eta_seconds)
 
     with report_path.open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(
@@ -904,7 +1017,9 @@ def launch_gui() -> int:
     var_lang = tk.StringVar(value="de")
     var_dark = tk.BooleanVar(value=True)
     var_img1 = tk.StringVar(value=str(get_default_image_dir(script_dir)))
-    var_img2 = tk.StringVar(value="")
+    var_img2 = tk.StringVar(value=str(get_default_steam_screenshot_dir() or ""))
+    var_use_img1 = tk.BooleanVar(value=True)
+    var_use_img2 = tk.BooleanVar(value=True)
     var_journals = tk.StringVar(value=str(get_default_journal_dir(script_dir)))
     var_output = tk.StringVar(value=str(default_output_dir))
 
@@ -1049,11 +1164,11 @@ def launch_gui() -> int:
             pass
         root.after(100, flush_logs)
 
-    def update_progress(done: int, total: int) -> None:
+    def update_progress(done: int, total: int, eta_seconds: Optional[float] = None) -> None:
         def _apply() -> None:
             total_safe = max(total, 1)
             progress_value.set((done / total_safe) * 100.0)
-            progress_text_var.set(f"{done} / {total}")
+            progress_text_var.set(build_progress_text(done, total, var_lang.get(), eta_seconds))
         root.after(0, _apply)
 
     def open_output_folder() -> None:
@@ -1095,6 +1210,7 @@ def launch_gui() -> int:
         stop_button.configure(state=("normal" if running else "disabled"))
         open_output_button.configure(state=("normal" if not running else "disabled"))
         update_conversion_controls()
+        update_image_dir_controls()
         if running:
             status_var.set(t(var_lang.get(), "running"))
 
@@ -1115,6 +1231,20 @@ def launch_gui() -> int:
             widget.configure(state=("normal" if enabled and fmt == "webp" else "disabled"))
         png_spin.configure(state=("normal" if enabled and fmt == "png" else "disabled"))
         set_conversion_note()
+
+    def update_image_dir_controls(*_args) -> None:
+        rows = [
+            (var_use_img1, img1_check, img1_label, img1_entry, img1_button, None),
+            (var_use_img2, img2_check, img2_label, img2_entry, img2_button, img2_note),
+        ]
+        for enabled_var, check, label, entry, button, note in rows:
+            enabled = bool(enabled_var.get()) and not is_running["value"]
+            check.configure(state=("normal" if not is_running["value"] else "disabled"))
+            label.configure(style=("TLabel" if enabled_var.get() else "Muted.TLabel"))
+            if note is not None:
+                note.configure(style=("Muted.TLabel" if enabled_var.get() else "Status.TLabel"))
+            entry.configure(state=("normal" if enabled else "disabled"))
+            button.configure(state=("normal" if enabled else "disabled"))
 
     def refresh_texts(*_args) -> None:
         lang = var_lang.get()
@@ -1169,9 +1299,9 @@ def launch_gui() -> int:
             return
         lang = var_lang.get()
         image_dirs: list[Path] = []
-        if var_img1.get().strip():
+        if var_use_img1.get() and var_img1.get().strip():
             image_dirs.append(Path(var_img1.get()).expanduser())
-        if var_img2.get().strip():
+        if var_use_img2.get() and var_img2.get().strip():
             image_dirs.append(Path(var_img2.get()).expanduser())
         if not image_dirs:
             messagebox.showerror(t(lang, "app_title"), t(lang, "select_image_folder"))
@@ -1194,7 +1324,7 @@ def launch_gui() -> int:
 
         ensure_dir(output_dir)
         stop_event.clear()
-        update_progress(0, 0)
+        update_progress(0, 0, None)
         settings = ConversionSettings(
             enabled=bool(var_convert.get()),
             target_format=var_format.get().lower(),
@@ -1238,28 +1368,39 @@ def launch_gui() -> int:
 
     folders_frame = ttk.LabelFrame(main, padding=12)
     folders_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-    folders_frame.columnconfigure(1, weight=1)
+    folders_frame.columnconfigure(2, weight=1)
+    folders_frame.columnconfigure(3, weight=0)
 
-    def add_path_row(parent, row: int, label_key: str, variable: 'tk.StringVar', note_key: Optional[str] = None):
+    def add_path_row(parent, row: int, label_key: str, variable: 'tk.StringVar', note_key: Optional[str] = None, enabled_var: Optional['tk.BooleanVar'] = None):
+        check = None
+        if enabled_var is not None:
+            check = ttk.Checkbutton(parent, variable=enabled_var)
+            check.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=5)
+
+        label_column = 1
+        entry_column = 2
+        button_column = 3
+
         label = ttk.Label(parent)
-        label.grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+        label.grid(row=row, column=label_column, sticky="w", padx=(0, 10), pady=5)
         entry = ttk.Entry(parent, textvariable=variable)
-        entry.grid(row=row, column=1, sticky="ew", pady=5)
+        entry.grid(row=row, column=entry_column, sticky="ew", pady=5)
         button = ttk.Button(parent, command=lambda: browse_dir(variable))
-        button.grid(row=row, column=2, sticky="ew", padx=(10, 0), pady=5)
+        button.grid(row=row, column=button_column, sticky="ew", padx=(10, 0), pady=5)
         text_keys[label_key] = label
         text_keys[f"{label_key}_browse"] = button
+
         note = None
         if note_key:
             note = ttk.Label(parent, style="Muted.TLabel")
-            note.grid(row=row + 1, column=1, sticky="w", pady=(0, 4))
+            note.grid(row=row + 1, column=entry_column, sticky="w", pady=(0, 4))
             text_keys[note_key] = note
-        return entry, button, note
+        return check, label, entry, button, note
 
-    img1_entry, img1_button, _ = add_path_row(folders_frame, 0, "screenshots_1", var_img1)
-    img2_entry, img2_button, _ = add_path_row(folders_frame, 2, "screenshots_2", var_img2, "screenshots_2_hint")
-    journals_entry, journals_button, _ = add_path_row(folders_frame, 4, "journals", var_journals)
-    output_entry, output_button, _ = add_path_row(folders_frame, 6, "output_folder", var_output)
+    img1_check, img1_label, img1_entry, img1_button, _ = add_path_row(folders_frame, 0, "screenshots_1", var_img1, enabled_var=var_use_img1)
+    img2_check, img2_label, img2_entry, img2_button, img2_note = add_path_row(folders_frame, 2, "screenshots_2", var_img2, "screenshots_2_hint", enabled_var=var_use_img2)
+    journals_check, journals_label, journals_entry, journals_button, _ = add_path_row(folders_frame, 4, "journals", var_journals)
+    output_check, output_label, output_entry, output_button, _ = add_path_row(folders_frame, 6, "output_folder", var_output)
 
     conversion_frame = ttk.LabelFrame(main, padding=12)
     conversion_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -1358,7 +1499,8 @@ def launch_gui() -> int:
 
     conversion_labels = [target_label, jpeg_label, webp_label, png_label]
     editable_widgets = [
-        img1_entry, img2_entry, journals_entry, output_entry, img1_button, img2_button, journals_button, output_button,
+        img1_check, img2_check, img1_entry, img2_entry, journals_entry, output_entry,
+        img1_button, img2_button, journals_button, output_button,
         lang_combo, dark_radio, light_radio, start_button, convert_check, target_combo, jpeg_spin, jpeg_opt_check,
         webp_spin, webp_lossless_check, png_spin, delete_check,
     ]
@@ -1383,11 +1525,14 @@ def launch_gui() -> int:
     var_lang.trace_add("write", on_language_change)
     var_format.trace_add("write", update_conversion_controls)
     var_convert.trace_add("write", update_conversion_controls)
+    var_use_img1.trace_add("write", update_image_dir_controls)
+    var_use_img2.trace_add("write", update_image_dir_controls)
 
     refresh_texts()
     apply_button_translations()
     apply_theme()
     update_conversion_controls()
+    update_image_dir_controls()
     stop_button.configure(state="disabled")
     flush_logs()
 
