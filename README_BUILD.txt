@@ -3,7 +3,7 @@ Elite Image Mapper - Windows EXE Build
 
 Version
 -------
-This build kit is prepared for Elite Image Mapper 0.9.2.
+This build kit is prepared for Elite Image Mapper 0.9.3
 
 License
 -------
